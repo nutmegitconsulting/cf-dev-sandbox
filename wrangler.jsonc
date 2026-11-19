@@ -1,0 +1,36 @@
+{
+  // cf-dev-sandbox: per-key persistent Linux sandboxes for a Hermes terminal backend. See README.md.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-dev-sandbox",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-18",
+  // enable_request_signal: a command stops when its caller disconnects.
+  "compatibility_flags": ["enable_request_signal"],
+  // No public entry. Callers reach it through a service binding, which decides the sandbox key.
+  "workers_dev": false,
+  "preview_urls": false,
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+  "containers": [
+    {
+      "class_name": "DevSandbox",
+      // Required for Container snapshots. Image and size are chosen in code at start().
+      "scheduling_policy": "durable_object",
+      "images": { "sandbox": { "dockerfile": "./Dockerfile" } }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "DEV_SANDBOX", "class_name": "DevSandbox" }]
+  },
+  "exports": {
+    "DevSandbox": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "vars": {
+    // Dev sandboxes need npm install / git clone. Nothing secret is ever placed inside.
+    "ENABLE_INTERNET": "true",
+    // lite, basic, standard-1 ... standard-4
+    "SANDBOX_INSTANCE": "lite"
+  }
+  // Optional secret SANDBOX_TOKEN: when set, every request needs `Authorization: Bearer <token>`.
+  // Only for deployments that add a route; leave unset behind a service binding.
+}
