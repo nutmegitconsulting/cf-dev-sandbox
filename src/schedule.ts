@@ -30,6 +30,14 @@ export const MAX_OUTPUT_BYTES = 1024 * 1024;
 export const DEFAULT_TIMEOUT_S = 120;
 export const MAX_TIMEOUT_S = 3600;
 
+/** Interactive shells open at once in one sandbox. */
+export const MAX_PTY_SESSIONS = 8;
+/** A shell with input or output this recently counts as a command in flight: no save, no stop. */
+export const PTY_ACTIVE_MS = MINUTE;
+/** How often an open shell's traffic is written down as activity. */
+export const PTY_ACTIVITY_WRITE_MS = 5_000;
+export const PTY_DEFAULT_CWD = "/workspace";
+
 /**
  * When to wake a stopped sandbox whose snapshot was created or last restored at `anchor`: the first
  * KEEPALIVE_HOUR_UTC on or after anchor + KEEPALIVE_AFTER_DAYS. Always inside the 30-day window.
@@ -69,4 +77,37 @@ export function sameSecret(a: string, b: string): boolean {
   let diff = x.length ^ y.length;
   for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
   return diff === 0;
+}
+
+const clampInt = (value: unknown, low: number, high: number, fallback: number): number => {
+  const n = Math.floor(Number(value));
+  return Number.isFinite(n) && n >= low ? Math.min(n, high) : fallback;
+};
+
+export interface PtySize {
+  cols: number;
+  rows: number;
+}
+
+export function ptySize(cols: unknown, rows: unknown): PtySize {
+  return { cols: clampInt(cols, 2, 1000, 80), rows: clampInt(rows, 2, 1000, 24) };
+}
+
+/** Where a shell starts: an absolute path, or the workspace. The shell itself falls back when it is missing. */
+export function ptyCwd(value: string | null): string {
+  if (!value || !value.startsWith("/") || value.length > 4096 || value.includes("\0")) return PTY_DEFAULT_CWD;
+  return value;
+}
+
+/** A text frame from the client. Keystrokes travel as binary frames, so text is only ever control. */
+export function ptyControl(text: string): { resize: PtySize } | null {
+  try {
+    const message = JSON.parse(text) as { resize?: unknown };
+    if (Array.isArray(message.resize) && message.resize.length === 2) {
+      return { resize: ptySize(message.resize[0], message.resize[1]) };
+    }
+  } catch {
+    // not JSON
+  }
+  return null;
 }
