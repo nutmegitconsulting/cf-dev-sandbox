@@ -11,6 +11,9 @@
  *   GET  /home    -> {home}
  *   GET  /status  -> lifecycle state, no command output
  *   POST /reset   discard the snapshot and stop: the next command starts from the image
+ *   GET  /pty     WebSocket: an interactive shell. Query cols, rows, cwd. Binary frames are the
+ *                 terminal's bytes both ways; text frames are control: {"resize":[cols,rows]} in,
+ *                 {"exit":code} or {"error":message} out, just before the close.
  *
  * Reachability is the caller's job. Deployed with workers_dev: false and no routes, the only way in
  * is a service binding, and the binding owner decides the key. With SANDBOX_TOKEN set, every request
@@ -24,10 +27,17 @@ import {
   INACTIVITY_TIMEOUT_MS,
   KEEPALIVE_HOLD_MS,
   MAX_COMMAND_BYTES,
+  MAX_PTY_SESSIONS,
   MAX_STDIN_BYTES,
+  PTY_ACTIVE_MS,
+  PTY_ACTIVITY_WRITE_MS,
+  PTY_DEFAULT_CWD,
   clampTimeout,
   decodeCapped,
   keepaliveDue,
+  ptyControl,
+  ptyCwd,
+  ptySize,
   sameSecret,
   validKey,
 } from "./schedule";
@@ -58,10 +68,43 @@ const json = (body: unknown, status = 200) => Response.json(body, { status });
 
 type Instance = NonNullable<ContainerStartupOptions["instance"]>;
 
+/** One open interactive shell. */
+interface PtySession {
+  socket: WebSocket;
+  /** Names the shell's pid file in the container. */
+  id: string;
+  proc: ExecProcess;
+  lastTraffic: number;
+}
+
+// The shell notes its own pid, which is the only name the hangup below can find it by. It falls back
+// to the workspace when its folder is gone, so a stale tab still opens.
+const PTY_RUN = "/run/sandbox-pty";
+const PTY_SCRIPT = `mkdir -p ${PTY_RUN} && echo $$ > ${PTY_RUN}/"$2"; cd -- "$1" 2>/dev/null || cd ${PTY_DEFAULT_CWD} 2>/dev/null; export TERM=xterm-256color; exec bash -l`;
+// Hang up everything on the shell's terminal, as a real terminal closing does (the shell leads its
+// session, so the session is its pid), then make sure of the shell itself: a bash waiting on a
+// command doesn't act on a hangup until that command ends.
+const PTY_HANGUP = `f=${PTY_RUN}/"$1"; pid=$(cat "$f" 2>/dev/null); rm -f "$f"; [ -n "$pid" ] || exit 0; pkill -HUP -s "$pid"; sleep 1; kill -KILL "$pid" 2>/dev/null; true`;
+
 export class DevSandbox extends DurableObject<Env> {
   private queue: Promise<unknown> = Promise.resolve();
   /** Commands in flight, counted before they wait for the lock, so a save never stops one. */
   private busy = 0;
+  /** Open interactive shells. They live in memory only: a Durable Object restart closes them. */
+  private ptys = new Set<PtySession>();
+  private ptyActivityWritten = 0;
+
+  /** A command is in flight, or someone is typing in or reading from a shell. */
+  private inUse(now = Date.now()): boolean {
+    if (this.busy > 0) return true;
+    for (const session of this.ptys) if (now - session.lastTraffic < PTY_ACTIVE_MS) return true;
+    return false;
+  }
+
+  /** Close every shell: the instance under them is going away. */
+  private closePtys(reason: string): void {
+    for (const session of [...this.ptys]) this.endPty(session, { error: reason });
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -162,7 +205,8 @@ export class DevSandbox extends DurableObject<Env> {
       }
 
       if (s.keepaliveUntil) {
-        if (this.busy === 0 && now >= s.keepaliveUntil) {
+        if (!this.inUse(now) && now >= s.keepaliveUntil) {
+          this.closePtys("the sandbox stopped");
           await container.destroy("keepalive");
           await this.ctx.storage.delete("keepaliveUntil");
           console.log(JSON.stringify({ event: "keepalive.stop" }));
@@ -176,8 +220,8 @@ export class DevSandbox extends DurableObject<Env> {
       const lastActivity = s.lastActivity ?? 0;
       const savedAt = s.savedAt ?? 0;
       const changed = lastActivity > savedAt;
-      const idle = this.busy === 0 && now - lastActivity > IDLE_LIMIT_MS;
-      const checkpoint = this.busy === 0 && changed && now - savedAt > CHECKPOINT_INTERVAL_MS;
+      const idle = !this.inUse(now) && now - lastActivity > IDLE_LIMIT_MS;
+      const checkpoint = !this.inUse(now) && changed && now - savedAt > CHECKPOINT_INTERVAL_MS;
 
       if ((idle && changed) || checkpoint) {
         try {
@@ -191,8 +235,9 @@ export class DevSandbox extends DurableObject<Env> {
         }
       }
       // A command that arrived during the save keeps the instance running.
-      const usedDuringSave = this.busy > 0 || (await this.ctx.storage.get<number>("lastActivity")) !== s.lastActivity;
+      const usedDuringSave = this.inUse() || (await this.ctx.storage.get<number>("lastActivity")) !== s.lastActivity;
       if (idle && !usedDuringSave) {
+        this.closePtys("the sandbox stopped after 10 minutes with no activity");
         await container.destroy("idle");
         await this.scheduleKeepalive();
         return;
@@ -210,6 +255,7 @@ export class DevSandbox extends DurableObject<Env> {
       if (pathname === "/home" && request.method === "GET") return await this.home();
       if (pathname === "/status" && request.method === "GET") return await this.status();
       if (pathname === "/reset" && request.method === "POST") return await this.reset();
+      if (pathname === "/pty" && request.method === "GET") return await this.pty(request);
       return json({ error: "not found" }, 404);
     } catch (err) {
       return json({ error: err instanceof Error ? err.message : String(err) }, 500);
@@ -270,6 +316,111 @@ export class DevSandbox extends DurableObject<Env> {
     }
   }
 
+  // --- interactive shell -------------------------------------------------------------------------
+  private async pty(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return json({ error: "/pty is a WebSocket" }, 426);
+    }
+    if (this.ptys.size >= MAX_PTY_SESSIONS) {
+      return json({ error: `${MAX_PTY_SESSIONS} shells are already open in this sandbox` }, 429);
+    }
+    const query = new URL(request.url).searchParams;
+    const size = ptySize(query.get("cols"), query.get("rows"));
+    const cwd = ptyCwd(query.get("cwd"));
+
+    let proc: ExecProcess;
+    const id = crypto.randomUUID();
+    this.busy++;
+    try {
+      const container = await this.ensureRunning();
+      await this.ctx.storage.put("lastActivity", Date.now());
+      proc = await container.exec(["bash", "-c", PTY_SCRIPT, "sandbox", cwd, id], { pty: size, stdin: "pipe" });
+    } finally {
+      this.busy--;
+    }
+
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    const session: PtySession = { socket: server, id, proc, lastTraffic: Date.now() };
+    this.ptys.add(session);
+    const input = proc.stdin?.getWriter();
+    let writes: Promise<unknown> = Promise.resolve();
+    // Without this a binary frame arrives as a Blob, which is read asynchronously.
+    server.binaryType = "arraybuffer";
+
+    server.addEventListener("message", (event) => {
+      this.ptyTraffic(session);
+      if (typeof event.data === "string") {
+        const control = ptyControl(event.data);
+        if (control) {
+          try {
+            proc.resize(control.resize.cols, control.resize.rows);
+          } catch {
+            // the shell has just exited
+          }
+        }
+        return;
+      }
+      // Writes are chained so keystrokes keep their order whichever form a frame arrives in.
+      const data = event.data as ArrayBuffer | Blob;
+      writes = writes
+        .then(async () => input?.write(new Uint8Array(data instanceof ArrayBuffer ? data : await data.arrayBuffer())))
+        .catch(() => {});
+    });
+    const gone = () => this.endPty(session);
+    server.addEventListener("close", gone);
+    server.addEventListener("error", gone);
+
+    const output = (async () => {
+      if (!proc.stdout) return;
+      for await (const chunk of proc.stdout as unknown as AsyncIterable<Uint8Array>) {
+        if (!this.ptys.has(session)) return;
+        this.ptyTraffic(session);
+        server.send(chunk);
+      }
+    })().catch(() => {});
+    void proc.exitCode.then(
+      async (code) => {
+        // The last output can arrive just after the exit code.
+        await Promise.race([output, new Promise((resolve) => setTimeout(resolve, 1000))]);
+        this.endPty(session, { exit: code });
+      },
+      (err) => this.endPty(session, { error: String(err) }),
+    );
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** Input or output on a shell is activity, written down at most every few seconds. */
+  private ptyTraffic(session: PtySession): void {
+    const now = Date.now();
+    session.lastTraffic = now;
+    if (now - this.ptyActivityWritten < PTY_ACTIVITY_WRITE_MS) return;
+    this.ptyActivityWritten = now;
+    this.ctx.waitUntil(this.ctx.storage.put("lastActivity", now));
+  }
+
+  /** Close a shell once: say why, close the socket, and stop the process if it is still there. */
+  private endPty(session: PtySession, last?: { exit: number } | { error: string }): void {
+    if (!this.ptys.delete(session)) return;
+    try {
+      if (last) session.socket.send(JSON.stringify(last));
+      session.socket.close(1000);
+    } catch {
+      // already closed
+    }
+    const container = this.ctx.container;
+    if (!container?.running) return;
+    // The shell exited and only its pid file is left, or the tab closed under a running shell.
+    const exited = last !== undefined && "exit" in last;
+    const argv = exited ? ["rm", "-f", `${PTY_RUN}/${session.id}`] : ["sh", "-c", PTY_HANGUP, "hangup", session.id];
+    this.ctx.waitUntil(
+      container.exec(argv, { stdout: "ignore", stderr: "ignore" })
+        .then((proc) => proc.exitCode)
+        .catch(() => {}),
+    );
+  }
+
   private async status(): Promise<Response> {
     const s = await this.state();
     return json({
@@ -281,6 +432,7 @@ export class DevSandbox extends DurableObject<Env> {
       last_activity: s.lastActivity ?? null,
       saved_at: s.savedAt ?? null,
       next_alarm: await this.ctx.storage.getAlarm(),
+      shells: this.ptys.size,
     });
   }
 
@@ -288,6 +440,7 @@ export class DevSandbox extends DurableObject<Env> {
   private async reset(): Promise<Response> {
     if (this.busy > 0) return json({ error: "a command is running" }, 409);
     await this.exclusive(async () => {
+      this.closePtys("the sandbox was reset");
       if (this.container.running) await this.container.destroy("reset");
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();

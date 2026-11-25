@@ -4,6 +4,9 @@ import {
   clampTimeout,
   decodeCapped,
   keepaliveDue,
+  ptyControl,
+  ptyCwd,
+  ptySize,
   sameSecret,
   validKey,
 } from "../src/schedule";
@@ -63,5 +66,29 @@ describe("request checks", () => {
     expect(sameSecret("abc", "abc")).toBe(true);
     expect(sameSecret("abc", "abd")).toBe(false);
     expect(sameSecret("abc", "abcd")).toBe(false);
+  });
+});
+
+describe("interactive shell", () => {
+  it("takes a sane size and falls back to 80x24", () => {
+    expect(ptySize("132", "43")).toEqual({ cols: 132, rows: 43 });
+    expect(ptySize(null, "x")).toEqual({ cols: 80, rows: 24 });
+    expect(ptySize(0, -5)).toEqual({ cols: 80, rows: 24 });
+    expect(ptySize(99999, 2)).toEqual({ cols: 1000, rows: 2 });
+  });
+
+  it("starts in an absolute folder, else the workspace", () => {
+    expect(ptyCwd("/workspace/app")).toBe("/workspace/app");
+    expect(ptyCwd(null)).toBe("/workspace");
+    expect(ptyCwd("app")).toBe("/workspace");
+    expect(ptyCwd("/a\0b")).toBe("/workspace");
+    expect(ptyCwd("/" + "a".repeat(5000))).toBe("/workspace");
+  });
+
+  it("reads a resize and ignores any other text frame", () => {
+    expect(ptyControl('{"resize":[120,40]}')).toEqual({ resize: { cols: 120, rows: 40 } });
+    expect(ptyControl('{"resize":[120]}')).toBeNull();
+    expect(ptyControl("ls -la\n")).toBeNull();
+    expect(ptyControl('{"exit":0}')).toBeNull();
   });
 });
