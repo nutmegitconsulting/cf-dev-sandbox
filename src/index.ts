@@ -80,7 +80,10 @@ interface PtySession {
 // The shell notes its own pid, which is the only name the hangup below can find it by. It falls back
 // to the workspace when its folder is gone, so a stale tab still opens.
 const PTY_RUN = "/run/sandbox-pty";
-const PTY_SCRIPT = `mkdir -p ${PTY_RUN} && echo $$ > ${PTY_RUN}/"$2"; cd -- "$1" 2>/dev/null || cd ${PTY_DEFAULT_CWD} 2>/dev/null; export TERM=xterm-256color; exec bash -l`;
+// The image's prompt names the host, which here is a 64-character container id. Once the shell's
+// own files have run, a prompt still of that form becomes `sandbox:/workspace# `; one the user set is kept.
+const PTY_PROMPT = `'case $PS1 in *"\\u@\\h"*) PS1="sandbox:\\w\\\\$ ";; esac; unset PROMPT_COMMAND'`;
+const PTY_SCRIPT = `mkdir -p ${PTY_RUN} && echo $$ > ${PTY_RUN}/"$2"; cd -- "$1" 2>/dev/null || cd ${PTY_DEFAULT_CWD} 2>/dev/null; export TERM=xterm-256color; export PROMPT_COMMAND=${PTY_PROMPT}; exec bash -l`;
 // Hang up everything on the shell's terminal, as a real terminal closing does (the shell leads its
 // session, so the session is its pid), then make sure of the shell itself: a bash waiting on a
 // command doesn't act on a hangup until that command ends.
